@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat de Áudio WebRTC</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f0f2f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .controls {
+            margin: 20px 0;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            background-color: #0084ff;
+            color: white;
+            cursor: pointer;
+        }
+        button:disabled {
+            background-color: #cccccc;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .connected {
+            background-color: #e6ffe6;
+            color: #006600;
+        }
+        .disconnected {
+            background-color: #ffe6e6;
+            color: #660000;
+        }
+        .room-controls {
+            margin: 20px 0;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+        .volume-control {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .volume-slider {
+            flex: 1;
+        }
+        .participants {
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+        .participant {
+            padding: 5px;
+            margin: 5px 0;
+            background-color: #e9ecef;
+            border-radius: 4px;
+        }
+        .error {
+            color: #dc3545;
+            padding: 10px;
+            margin: 10px 0;
+            background-color: #f8d7da;
+            border-radius: 4px;
+            display: none;
+        }
+        h3 {
+            margin-top: 0;
+            color: #495057;
+            font-size: 1.1rem;
+        }
+        .connection-details {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Chat de Áudio WebRTC</h1>
+        
+        <div class="room-controls">
+            <h3>Passo 1: Escolha ou crie uma sala</h3>
+            <input type="text" id="roomInput" placeholder="Nome da sala" value="test-room">
+            <button id="createRoomBtn">Criar/Entrar na Sala</button>
+        </div>
+        
+        <div class="controls">
+            <h3>Passo 2: Entre na sala</h3>
+            <button id="joinBtn" disabled>Entrar na Sala</button>
+            <button id="leaveBtn" disabled>Sair da Sala</button>
+            <button id="muteBtn" disabled>Mutar</button>
+            <button id="resetBtn" disabled>Nova Sala</button>
+        </div>
+        
+        <div class="volume-control">
+            <label for="volumeSlider">Volume:</label>
+            <input type="range" id="volumeSlider" class="volume-slider" min="0" max="100" value="100">
+        </div>
+        
+        <div id="status" class="status disconnected">
+            Desconectado
+        </div>
+        
+        <div id="connectionDetails" class="connection-details" style="display: none;">
+            <p>Sala: <span id="currentRoom">-</span></p>
+            <p>Seu ID: <span id="currentUserId">-</span></p>
+            <p>Participantes: <span id="participantCount">0</span></p>
+        </div>
+        
+        <div id="error" class="error"></div>
+        
+        <div class="participants">
+            <h3>Participantes</h3>
+            <div id="participantsList"></div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io('http://localhost:3001');
+        const joinBtn = document.getElementById('joinBtn');
+        const leaveBtn = document.getElementById('leaveBtn');
+        const muteBtn = document.getElementById('muteBtn');
+        const statusDiv = document.getElementById('status');
+        const errorDiv = document.getElementById('error');
+        const roomInput = document.getElementById('roomInput');
+        const createRoomBtn = document.getElementById('createRoomBtn');
+        const volumeSlider = document.getElementById('volumeSlider');
+        const participantsList = document.getElementById('participantsList');
+        const connectionDetails = document.getElementById('connectionDetails');
+        const currentRoomSpan = document.getElementById('currentRoom');
+        const currentUserIdSpan = document.getElementById('currentUserId');
+        const participantCountSpan = document.getElementById('participantCount');
+        const resetBtn = document.getElementById('resetBtn');
+
+        let localStream;
+        let peerConnections = {};
+        let roomId = 'test-room';
+        let userId = Math.random().toString(36).substr(2, 9);
+        let isMuted = false;
+        let participants = new Set();
+        let audioContext;
+        let gainNode;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 3;
+
+        // Configuração melhorada do WebRTC com TURN
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun2.l.google.com:19302' },
+                // Adicione seus servidores TURN aqui
+                // { urls: 'turn:seu-servidor-turn.com', username: 'usuario', credential: 'senha' }
+            ],
+            iceCandidatePoolSize: 10
+        };
+
+        // Configurações de áudio
+        const audioConstraints = {
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            }
+        };
+
+        createRoomBtn.addEventListener('click', () => {
+            roomId = roomInput.value.trim();
+            if (roomId) {
+                // Habilitar o botão de entrar
+                joinBtn.disabled = false;
+                errorDiv.style.display = 'none';
+                
+                // Atualizar o texto do botão para indicar que a sala está pronta
+                createRoomBtn.textContent = `Sala "${roomId}" pronta`;
+                createRoomBtn.disabled = true;
+                
+                // Focar no botão de entrar
+                joinBtn.focus();
+            } else {
+                showError('Por favor, insira um nome de sala válido');
+            }
+        });
+
+        joinBtn.addEventListener('click', async () => {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+                
+                // Configurar processamento de áudio
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioContext.createMediaStreamSource(localStream);
+                gainNode = audioContext.createGain();
+                gainNode.gain.value = volumeSlider.value / 100;
+                source.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                joinBtn.disabled = true;
+                leaveBtn.disabled = false;
+                muteBtn.disabled = false;
+                resetBtn.disabled = false;
+                statusDiv.textContent = 'Conectado';
+                statusDiv.className = 'status connected';
+                
+                // Atualizar detalhes de conexão
+                currentRoomSpan.textContent = roomId;
+                currentUserIdSpan.textContent = userId;
+                connectionDetails.style.display = 'block';
+                
+                socket.emit('join-room', roomId, userId);
+                
+                // Resetar tentativas de reconexão
+                reconnectAttempts = 0;
+            } catch (err) {
+                console.error('Erro ao acessar microfone:', err);
+                showError('Erro ao acessar o microfone. Verifique as permissões.');
+            }
+        });
+
+        leaveBtn.addEventListener('click', () => {
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+            
+            Object.values(peerConnections).forEach(pc => pc.close());
+            peerConnections = {};
+            
+            socket.emit('leave-room', roomId, userId);
+            joinBtn.disabled = false;
+            leaveBtn.disabled = true;
+            muteBtn.disabled = true;
+            resetBtn.disabled = true;
+            statusDiv.textContent = 'Desconectado';
+            statusDiv.className = 'status disconnected';
+            
+            // Esconder detalhes de conexão
+            connectionDetails.style.display = 'none';
+            
+            participants.clear();
+            updateParticipantsList();
+        });
+
+        resetBtn.addEventListener('click', () => {
+            // Sair da sala atual
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+            
+            Object.values(peerConnections).forEach(pc => pc.close());
+            peerConnections = {};
+            
+            socket.emit('leave-room', roomId, userId);
+            
+            // Resetar interface
+            joinBtn.disabled = false;
+            leaveBtn.disabled = true;
+            muteBtn.disabled = true;
+            resetBtn.disabled = true;
+            statusDiv.textContent = 'Desconectado';
+            statusDiv.className = 'status disconnected';
+            connectionDetails.style.display = 'none';
+            
+            // Resetar sala
+            roomInput.value = '';
+            createRoomBtn.disabled = false;
+            createRoomBtn.textContent = 'Criar/Entrar na Sala';
+            
+            participants.clear();
+            updateParticipantsList();
+        });
+
+        muteBtn.addEventListener('click', () => {
+            if (localStream) {
+                isMuted = !isMuted;
+                localStream.getAudioTracks().forEach(track => {
+                    track.enabled = !isMuted;
+                });
+                muteBtn.textContent = isMuted ? 'Desmutar' : 'Mutar';
+            }
+        });
+
+        volumeSlider.addEventListener('input', () => {
+            if (gainNode) {
+                gainNode.gain.value = volumeSlider.value / 100;
+            }
+        });
+
+        function showError(message) {
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            setTimeout(() => {
+                errorDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        function updateParticipantsList() {
+            participantsList.innerHTML = '';
+            participants.forEach(participant => {
+                const div = document.createElement('div');
+                div.className = 'participant';
+                div.textContent = participant === userId ? `Você (${participant})` : participant;
+                participantsList.appendChild(div);
+            });
+            
+            // Atualizar contagem de participantes
+            participantCountSpan.textContent = participants.size;
+        }
+
+        socket.on('user-connected', async (newUserId) => {
+            console.log('Novo usuário conectado:', newUserId);
+            participants.add(newUserId);
+            updateParticipantsList();
+            createPeerConnection(newUserId);
+        });
+
+        socket.on('user-disconnected', (disconnectedUserId) => {
+            console.log('Usuário desconectado:', disconnectedUserId);
+            participants.delete(disconnectedUserId);
+            updateParticipantsList();
+            
+            if (peerConnections[disconnectedUserId]) {
+                peerConnections[disconnectedUserId].close();
+                delete peerConnections[disconnectedUserId];
+            }
+        });
+
+        socket.on('room-full', () => {
+            showError('A sala está cheia. Tente outra sala.');
+        });
+
+        socket.on('room-users', (users) => {
+            console.log('Usuários na sala:', users);
+            participants.clear();
+            users.forEach(user => participants.add(user));
+            updateParticipantsList();
+        });
+
+        socket.on('offer', async (offer, fromUserId) => {
+            console.log('Recebendo oferta de:', fromUserId);
+            const pc = createPeerConnection(fromUserId);
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit('answer', answer, roomId, userId);
+        });
+
+        socket.on('answer', async (answer, fromUserId) => {
+            console.log('Recebendo resposta de:', fromUserId);
+            const pc = peerConnections[fromUserId];
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(answer));
+            }
+        });
+
+        socket.on('ice-candidate', async (candidate, fromUserId) => {
+            console.log('Recebendo candidato ICE de:', fromUserId);
+            const pc = peerConnections[fromUserId];
+            if (pc) {
+                await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            }
+        });
+
+        function createPeerConnection(userId) {
+            if (peerConnections[userId]) {
+                return peerConnections[userId];
+            }
+
+            const pc = new RTCPeerConnection(configuration);
+            peerConnections[userId] = pc;
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', event.candidate, roomId, userId);
+                }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                console.log(`Estado da conexão ICE com ${userId}:`, pc.iceConnectionState);
+                if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                    showError(`Conexão com ${userId} perdida. Tentando reconectar...`);
+                    
+                    // Tentar reconectar
+                    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                        reconnectAttempts++;
+                        setTimeout(() => {
+                            console.log(`Tentativa de reconexão ${reconnectAttempts} com ${userId}`);
+                            createPeerConnection(userId);
+                        }, 2000 * reconnectAttempts); // Aumentar o tempo entre tentativas
+                    } else {
+                        showError(`Não foi possível reconectar com ${userId} após ${MAX_RECONNECT_ATTEMPTS} tentativas.`);
+                    }
+                } else if (pc.iceConnectionState === 'connected') {
+                    // Conexão estabelecida com sucesso
+                    reconnectAttempts = 0;
+                }
+            };
+
+            pc.ontrack = (event) => {
+                const remoteAudio = new Audio();
+                remoteAudio.srcObject = event.streams[0];
+                remoteAudio.autoplay = true;
+                remoteAudio.volume = volumeSlider.value / 100;
+                
+                // Atualizar volume quando o slider mudar
+                volumeSlider.addEventListener('input', () => {
+                    remoteAudio.volume = volumeSlider.value / 100;
+                });
+            };
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+            }
+
+            pc.onnegotiationneeded = async () => {
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    socket.emit('offer', offer, roomId, userId);
+                } catch (err) {
+                    console.error('Erro na negociação:', err);
+                    showError('Erro na negociação da conexão');
+                }
+            };
+
+            return pc;
+        }
+    </script>
+</body>
+</html> 

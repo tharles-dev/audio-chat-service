@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Teste de Áudio Chat</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+        .controls {
+            flex: 1;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+        }
+        .participants {
+            flex: 1;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+        }
+        button {
+            padding: 8px 16px;
+            margin: 5px;
+            cursor: pointer;
+        }
+        input {
+            padding: 8px;
+            margin: 5px;
+            width: 200px;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .participant {
+            padding: 5px;
+            margin: 5px 0;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Teste de Áudio Chat</h1>
+    
+    <div class="container">
+        <div class="controls">
+            <h2>Controles</h2>
+            <div>
+                <input type="text" id="userId" placeholder="ID do Usuário" value="test-user-1">
+                <input type="text" id="username" placeholder="Nome do Usuário" value="Teste 1">
+                <input type="text" id="roomId" placeholder="ID da Sala" value="test-room">
+            </div>
+            <div>
+                <button id="joinBtn">Entrar na Sala</button>
+                <button id="leaveBtn">Sair da Sala</button>
+            </div>
+            <div>
+                <button id="muteBtn">Mutar/Desmutar</button>
+                <input type="range" id="volumeSlider" min="0" max="100" value="100">
+                <span id="volumeValue">100%</span>
+            </div>
+            <div id="connectionStatus" class="status disconnected">
+                Desconectado
+            </div>
+            <div id="localStreamStatus" class="status disconnected">
+                Sem acesso ao microfone
+            </div>
+        </div>
+        
+        <div class="participants">
+            <h2>Participantes</h2>
+            <div id="participantsList"></div>
+        </div>
+    </div>
+
+    <script>
+        // Configurações
+        const socket = io();
+        let localStream = null;
+        let peerConnections = new Map();
+        let isMuted = false;
+        let currentRoom = null;
+        let currentUserId = null;
+
+        // Elementos DOM
+        const joinBtn = document.getElementById('joinBtn');
+        const leaveBtn = document.getElementById('leaveBtn');
+        const muteBtn = document.getElementById('muteBtn');
+        const volumeSlider = document.getElementById('volumeSlider');
+        const volumeValue = document.getElementById('volumeValue');
+        const connectionStatus = document.getElementById('connectionStatus');
+        const localStreamStatus = document.getElementById('localStreamStatus');
+        const participantsList = document.getElementById('participantsList');
+
+        // Eventos do Socket
+        socket.on('connect', () => {
+            console.log('Conectado ao servidor');
+            connectionStatus.textContent = 'Conectado ao servidor';
+            connectionStatus.className = 'status connected';
+        });
+
+        socket.on('disconnect', () => {
+            console.log('Desconectado do servidor');
+            connectionStatus.textContent = 'Desconectado do servidor';
+            connectionStatus.className = 'status disconnected';
+        });
+
+        socket.on('participants', (users) => {
+            console.log('Participantes atualizados:', users);
+            updateParticipantsList(users);
+            
+            // Criar conexões para novos participantes
+            users.forEach(user => {
+                if (user.userId !== currentUserId && !peerConnections.has(user.userId)) {
+                    createPeerConnection(user.userId);
+                }
+            });
+        });
+
+        socket.on('user-connected', (data) => {
+            console.log('Novo usuário conectado:', data);
+            createPeerConnection(data.userId);
+        });
+
+        socket.on('user-disconnected', (data) => {
+            console.log('Usuário desconectado:', data);
+            if (peerConnections.has(data.userId)) {
+                peerConnections.get(data.userId).close();
+                peerConnections.delete(data.userId);
+            }
+            
+            // Remover elemento de áudio
+            const audioElement = document.getElementById(`audio-${data.userId}`);
+            if (audioElement) {
+                audioElement.remove();
+            }
+        });
+
+        socket.on('offer', async ({ offer, fromUserId }) => {
+            console.log('Oferta recebida de:', fromUserId);
+            const pc = createPeerConnection(fromUserId);
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit('answer', answer, fromUserId);
+        });
+
+        socket.on('answer', async ({ answer, fromUserId }) => {
+            console.log('Resposta recebida de:', fromUserId);
+            const pc = peerConnections.get(fromUserId);
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(answer));
+            }
+        });
+
+        socket.on('ice-candidate', async ({ candidate, fromUserId }) => {
+            console.log('Candidato ICE recebido de:', fromUserId);
+            const pc = peerConnections.get(fromUserId);
+            if (pc) {
+                await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            }
+        });
+
+        // Funções
+        async function getLocalStream() {
+            try {
+                console.log('Solicitando acesso ao microfone...');
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+                console.log('Acesso ao microfone concedido');
+                localStreamStatus.textContent = 'Microfone ativo';
+                localStreamStatus.className = 'status connected';
+                return localStream;
+            } catch (error) {
+                console.error('Erro ao acessar microfone:', error);
+                localStreamStatus.textContent = 'Erro ao acessar microfone';
+                localStreamStatus.className = 'status disconnected';
+                throw error;
+            }
+        }
+
+        function createPeerConnection(targetUserId) {
+            console.log('Criando conexão peer para', targetUserId);
+            
+            const pc = new RTCPeerConnection({
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'stun:stun2.l.google.com:19302' },
+                    { urls: 'stun:stun3.l.google.com:19302' },
+                    { urls: 'stun:stun4.l.google.com:19302' }
+                ]
+            });
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    console.log('Enviando candidato ICE para', targetUserId);
+                    socket.emit('ice-candidate', event.candidate, targetUserId);
+                }
+            };
+
+            pc.ontrack = (event) => {
+                console.log('Recebendo track de áudio de', targetUserId);
+                const audioElement = document.createElement('audio');
+                audioElement.id = `audio-${targetUserId}`;
+                audioElement.autoplay = true;
+                audioElement.controls = true;
+                audioElement.srcObject = event.streams[0];
+                document.body.appendChild(audioElement);
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                console.log(`Estado ICE para ${targetUserId}:`, pc.iceConnectionState);
+            };
+
+            if (localStream) {
+                console.log('Adicionando track de áudio local para', targetUserId);
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+                
+                // Criar e enviar oferta
+                pc.createOffer()
+                    .then(offer => pc.setLocalDescription(offer))
+                    .then(() => {
+                        console.log('Enviando oferta para', targetUserId);
+                        socket.emit('offer', pc.localDescription, targetUserId);
+                    })
+                    .catch(error => {
+                        console.error('Erro ao criar oferta:', error);
+                    });
+            }
+
+            peerConnections.set(targetUserId, pc);
+            return pc;
+        }
+
+        async function joinRoom() {
+            const userId = document.getElementById('userId').value;
+            const username = document.getElementById('username').value;
+            const roomId = document.getElementById('roomId').value;
+            
+            if (!userId || !username || !roomId) {
+                alert('Preencha todos os campos');
+                return;
+            }
+
+            try {
+                await getLocalStream();
+                currentUserId = userId;
+                currentRoom = roomId;
+                
+                console.log('Entrando na sala:', roomId);
+                socket.emit('join', { gameId: roomId, userId, username });
+                
+                joinBtn.disabled = true;
+                leaveBtn.disabled = false;
+            } catch (error) {
+                console.error('Erro ao entrar na sala:', error);
+                alert('Erro ao entrar na sala: ' + error.message);
+            }
+        }
+
+        function leaveRoom() {
+            if (currentRoom && currentUserId) {
+                console.log('Saindo da sala:', currentRoom);
+                socket.emit('leave', { gameId: currentRoom, userId: currentUserId });
+                
+                // Limpar conexões peer
+                peerConnections.forEach(pc => pc.close());
+                peerConnections.clear();
+                
+                // Remover elementos de áudio
+                document.querySelectorAll('audio').forEach(el => el.remove());
+                
+                currentRoom = null;
+                currentUserId = null;
+                
+                joinBtn.disabled = false;
+                leaveBtn.disabled = true;
+            }
+        }
+
+        function toggleMute() {
+            if (localStream) {
+                isMuted = !isMuted;
+                localStream.getAudioTracks().forEach(track => {
+                    track.enabled = !isMuted;
+                });
+                muteBtn.textContent = isMuted ? 'Desmutar' : 'Mutar';
+            }
+        }
+
+        function updateVolume() {
+            const volume = volumeSlider.value / 100;
+            volumeValue.textContent = `${volumeSlider.value}%`;
+            
+            document.querySelectorAll('audio').forEach(audio => {
+                audio.volume = volume;
+            });
+        }
+
+        function updateParticipantsList(users) {
+            participantsList.innerHTML = '';
+            users.forEach(user => {
+                const div = document.createElement('div');
+                div.className = 'participant';
+                div.textContent = `${user.username} (${user.userId})`;
+                participantsList.appendChild(div);
+            });
+        }
+
+        // Event Listeners
+        joinBtn.addEventListener('click', joinRoom);
+        leaveBtn.addEventListener('click', leaveRoom);
+        muteBtn.addEventListener('click', toggleMute);
+        volumeSlider.addEventListener('input', updateVolume);
+        
+        // Inicialização
+        leaveBtn.disabled = true;
+    </script>
+</body>
+</html> 
