@@ -1,0 +1,16 @@
+version: '3'
+services:
+  audio-chat:
+    container_name: audio-chat
+    build: .
+    ports:
+      - "3001:3001"
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - audio-chat-network
+
+networks:
+  audio-chat-network:
+    driver: bridge 
