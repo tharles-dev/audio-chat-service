@@ -40,6 +40,57 @@ const rooms = new Map();
 const roomTimeouts = new Map();
 const userNames = new Map();
 const socketToUserId = new Map();
+const mutedUsers = new Map();
+const userSockets = new Map(); // Novo: mapear userId para socket
+const speakingUsers = new Map(); // roomId -> Set of speaking userIds
+
+// Função para validar entrada na sala
+function validateRoomEntry(gameId, userId, username) {
+  // Validar parâmetros
+  if (!gameId || !userId || !username) {
+    return { valid: false, error: 'Parâmetros inválidos' };
+  }
+
+  // Validar formato do userId (deve ser um UUID válido)
+  const uuidRegex =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(userId)) {
+    return { valid: false, error: 'ID de usuário inválido' };
+  }
+
+  // Verificar se o usuário já está em alguma sala
+  if (userSockets.has(userId)) {
+    const userSocket = userSockets.get(userId);
+    const userRooms = Array.from(userSocket.rooms);
+    const currentRoom = userRooms.find((room) => room !== userSocket.id);
+
+    // Se o usuário já está na sala que está tentando entrar, não permitir
+    if (currentRoom === gameId) {
+      return { valid: false, error: 'Usuário já está nesta sala' };
+    }
+
+    // Se o usuário está em outra sala, remover da sala anterior
+    if (currentRoom) {
+      console.log(
+        `[${new Date().toISOString()}] Removendo usuário ${userId} da sala ${currentRoom} antes de entrar na nova sala`
+      );
+      if (rooms.has(currentRoom)) {
+        rooms.get(currentRoom).delete(userId);
+        if (rooms.get(currentRoom).size === 0) {
+          checkEmptyRoom(currentRoom);
+        }
+      }
+      userSocket.leave(currentRoom);
+    }
+  }
+
+  // Verificar se a sala está cheia
+  if (rooms.has(gameId) && rooms.get(gameId).size >= MAX_USERS_PER_ROOM) {
+    return { valid: false, error: 'Sala cheia' };
+  }
+
+  return { valid: true };
+}
 
 // Função para verificar se uma sala está vazia e removê-la após um tempo
 function checkEmptyRoom(roomId) {
@@ -111,26 +162,33 @@ io.on('connection', (socket) => {
       `[${new Date().toISOString()}] Usuário ${username} (${userId}) tentando entrar na sala ${gameId}`
     );
 
-    // Verificar se a sala existe e está cheia
-    if (rooms.has(gameId) && rooms.get(gameId).size >= MAX_USERS_PER_ROOM) {
+    // Log para depuração
+    console.log(
+      `[${new Date().toISOString()}] Estado atual: userSockets tem ${userId}? ${userSockets.has(
+        userId
+      )}`
+    );
+    if (userSockets.has(userId)) {
+      const userSocket = userSockets.get(userId);
       console.log(
-        `[${new Date().toISOString()}] Tentativa de entrar em sala cheia: ${gameId}`
+        `[${new Date().toISOString()}] Usuário está em ${
+          userSocket.rooms.size
+        } salas`
       );
-      socket.emit('error', 'Sala cheia');
+    }
+
+    // Validar entrada
+    const validation = validateRoomEntry(gameId, userId, username);
+    if (!validation.valid) {
+      console.log(
+        `[${new Date().toISOString()}] Entrada negada: ${validation.error}`
+      );
+      socket.emit('error', validation.error);
       return;
     }
 
-    // Se o usuário já está em uma sala, remova-o
-    if (currentRoom) {
-      console.log(
-        `[${new Date().toISOString()}] Usuário ${currentUserId} saindo da sala ${currentRoom} para entrar em ${gameId}`
-      );
-      socket.leave(currentRoom);
-      if (rooms.has(currentRoom)) {
-        rooms.get(currentRoom).delete(currentUserId);
-        checkEmptyRoom(currentRoom);
-      }
-    }
+    // Registrar socket do usuário
+    userSockets.set(userId, socket);
 
     // Entrar na nova sala
     socket.join(gameId);
@@ -172,37 +230,71 @@ io.on('connection', (socket) => {
   // Quando um usuário quer sair da sala
   socket.on('leave', ({ gameId, userId }) => {
     console.log(
-      `[${new Date().toISOString()}] Usuário ${userId} saindo da sala ${gameId}`
+      `[${new Date().toISOString()}] Usuário ${userId} saiu da sala ${gameId}`
     );
 
+    // Limpar estado de mute
+    if (mutedUsers.has(userId)) {
+      mutedUsers.delete(userId);
+    }
+
+    // Remover usuário da sala
     if (rooms.has(gameId)) {
       rooms.get(gameId).delete(userId);
-      checkEmptyRoom(gameId);
+      if (rooms.get(gameId).size === 0) {
+        checkEmptyRoom(gameId);
+      }
     }
-    socket
-      .to(gameId)
-      .emit('user-disconnected', { userId, username: userNames.get(userId) });
-    userNames.delete(userId);
+
+    // Limpar mapeamentos
     socketToUserId.delete(socket.id);
-    currentRoom = null;
-    currentUserId = null;
+    userNames.delete(userId);
+
+    // Remover o socket do usuário do mapeamento userSockets
+    if (userSockets.has(userId)) {
+      userSockets.delete(userId);
+    }
+
+    // Notificar outros usuários
+    io.to(gameId).emit('user-left', { userId });
   });
 
   // Quando um usuário desconectar
   socket.on('disconnect', () => {
-    console.log(
-      `[${new Date().toISOString()}] Usuário desconectado: ${socket.id}`
+    const currentUserId = socketToUserId.get(socket.id);
+    const currentRoom = Array.from(socket.rooms).find(
+      (room) => room !== socket.id
     );
 
-    if (currentRoom && rooms.has(currentRoom)) {
-      rooms.get(currentRoom).delete(currentUserId);
-      checkEmptyRoom(currentRoom);
-      socket.to(currentRoom).emit('user-disconnected', {
-        userId: currentUserId,
-        username: userNames.get(currentUserId),
-      });
-      userNames.delete(currentUserId);
+    if (currentUserId && currentRoom) {
+      console.log(
+        `[${new Date().toISOString()}] Usuário ${currentUserId} desconectou da sala ${currentRoom}`
+      );
+
+      // Limpar estado de mute
+      if (mutedUsers.has(currentUserId)) {
+        mutedUsers.delete(currentUserId);
+      }
+
+      // Remover usuário da sala
+      if (rooms.has(currentRoom)) {
+        rooms.get(currentRoom).delete(currentUserId);
+        if (rooms.get(currentRoom).size === 0) {
+          checkEmptyRoom(currentRoom);
+        }
+      }
+
+      // Limpar mapeamentos
       socketToUserId.delete(socket.id);
+      userNames.delete(currentUserId);
+
+      // Remover o socket do usuário do mapeamento userSockets
+      if (userSockets.has(currentUserId)) {
+        userSockets.delete(currentUserId);
+      }
+
+      // Notificar outros usuários
+      io.to(currentRoom).emit('user-disconnected', { userId: currentUserId });
     }
   });
 
@@ -212,19 +304,35 @@ io.on('connection', (socket) => {
       `[${new Date().toISOString()}] Oferta de ${currentUserId} para ${targetUserId}`
     );
 
+    // Verificar se o usuário alvo ainda está na sala
     const targetSocket = getUserSocket(targetUserId);
-    if (targetSocket) {
+    if (!targetSocket) {
       console.log(
-        `[${new Date().toISOString()}] Enviando oferta para socket ${
-          targetSocket.id
-        }`
+        `[${new Date().toISOString()}] Socket não encontrado para o usuário ${targetUserId} - ignorando oferta`
       );
-      targetSocket.emit('offer', { offer, fromUserId: currentUserId });
-    } else {
-      console.log(
-        `[${new Date().toISOString()}] Socket não encontrado para o usuário ${targetUserId}`
-      );
+      return;
     }
+
+    // Verificar se o usuário alvo está na mesma sala
+    const currentRoom = Array.from(socket.rooms).find(
+      (room) => room !== socket.id
+    );
+    const targetRooms = Array.from(targetSocket.rooms);
+    const targetRoom = targetRooms.find((room) => room !== targetSocket.id);
+
+    if (currentRoom !== targetRoom) {
+      console.log(
+        `[${new Date().toISOString()}] Usuário ${targetUserId} não está na mesma sala - ignorando oferta`
+      );
+      return;
+    }
+
+    console.log(
+      `[${new Date().toISOString()}] Enviando oferta para socket ${
+        targetSocket.id
+      }`
+    );
+    targetSocket.emit('offer', { offer, fromUserId: currentUserId });
   });
 
   // Quando receber uma resposta
@@ -233,19 +341,35 @@ io.on('connection', (socket) => {
       `[${new Date().toISOString()}] Resposta de ${currentUserId} para ${targetUserId}`
     );
 
+    // Verificar se o usuário alvo ainda está na sala
     const targetSocket = getUserSocket(targetUserId);
-    if (targetSocket) {
+    if (!targetSocket) {
       console.log(
-        `[${new Date().toISOString()}] Enviando resposta para socket ${
-          targetSocket.id
-        }`
+        `[${new Date().toISOString()}] Socket não encontrado para o usuário ${targetUserId} - ignorando resposta`
       );
-      targetSocket.emit('answer', { answer, fromUserId: currentUserId });
-    } else {
-      console.log(
-        `[${new Date().toISOString()}] Socket não encontrado para o usuário ${targetUserId}`
-      );
+      return;
     }
+
+    // Verificar se o usuário alvo está na mesma sala
+    const currentRoom = Array.from(socket.rooms).find(
+      (room) => room !== socket.id
+    );
+    const targetRooms = Array.from(targetSocket.rooms);
+    const targetRoom = targetRooms.find((room) => room !== targetSocket.id);
+
+    if (currentRoom !== targetRoom) {
+      console.log(
+        `[${new Date().toISOString()}] Usuário ${targetUserId} não está na mesma sala - ignorando resposta`
+      );
+      return;
+    }
+
+    console.log(
+      `[${new Date().toISOString()}] Enviando resposta para socket ${
+        targetSocket.id
+      }`
+    );
+    targetSocket.emit('answer', { answer, fromUserId: currentUserId });
   });
 
   // Quando receber um candidato ICE
@@ -254,21 +378,302 @@ io.on('connection', (socket) => {
       `[${new Date().toISOString()}] Candidato ICE de ${currentUserId} para ${targetUserId}`
     );
 
+    // Verificar se o usuário alvo ainda está na sala
     const targetSocket = getUserSocket(targetUserId);
-    if (targetSocket) {
+    if (!targetSocket) {
       console.log(
-        `[${new Date().toISOString()}] Enviando candidato ICE para socket ${
-          targetSocket.id
-        }`
+        `[${new Date().toISOString()}] Socket não encontrado para o usuário ${targetUserId} - ignorando candidato ICE`
       );
-      targetSocket.emit('ice-candidate', {
-        candidate,
-        fromUserId: currentUserId,
-      });
+      return;
+    }
+
+    // Verificar se o usuário alvo está na mesma sala
+    const currentRoom = Array.from(socket.rooms).find(
+      (room) => room !== socket.id
+    );
+    const targetRooms = Array.from(targetSocket.rooms);
+    const targetRoom = targetRooms.find((room) => room !== targetSocket.id);
+
+    if (currentRoom !== targetRoom) {
+      console.log(
+        `[${new Date().toISOString()}] Usuário ${targetUserId} não está na mesma sala - ignorando candidato ICE`
+      );
+      return;
+    }
+
+    console.log(
+      `[${new Date().toISOString()}] Enviando candidato ICE para socket ${
+        targetSocket.id
+      }`
+    );
+    targetSocket.emit('ice-candidate', {
+      candidate,
+      fromUserId: currentUserId,
+    });
+  });
+
+  // Novo evento para mutar/desmutar um participante específico
+  socket.on('toggle-participant-mute', ({ targetUserId, isMuted }) => {
+    const currentUserId = socketToUserId.get(socket.id);
+    const currentRoom = Array.from(socket.rooms).find(
+      (room) => room !== socket.id
+    );
+
+    if (!currentRoom || !currentUserId) {
+      console.log(
+        `[${new Date().toISOString()}] Tentativa de mutar falhou: usuário não está em uma sala`
+      );
+      return;
+    }
+
+    // Verificar se o usuário que está enviando o evento é o dono da sala
+    const roomOwner = rooms.get(currentRoom)?.owner;
+    if (roomOwner && roomOwner !== currentUserId) {
+      console.log(
+        `[${new Date().toISOString()}] Tentativa de mutar falhou: usuário ${currentUserId} não é o dono da sala`
+      );
+      socket.emit('error', 'Apenas o dono da sala pode mutar participantes');
+      return;
+    }
+
+    console.log(
+      `[${new Date().toISOString()}] Usuário ${currentUserId} ${
+        isMuted ? 'mutando' : 'desmutando'
+      } ${targetUserId}`
+    );
+
+    if (!mutedUsers.has(targetUserId)) {
+      mutedUsers.set(targetUserId, new Set());
+    }
+
+    if (isMuted) {
+      mutedUsers.get(targetUserId).add(currentUserId);
+    } else {
+      mutedUsers.get(targetUserId).delete(currentUserId);
+    }
+
+    const totalUsuariosNaSala = rooms.get(currentRoom).size;
+
+    // Notificar todos os usuários na sala
+    io.to(currentRoom).emit('participant-mute-changed', {
+      userId: targetUserId,
+      isMuted,
+      mutedBy: currentUserId,
+      sala: currentRoom,
+      totalUsuariosNaSala,
+    });
+
+    // Enviar evento force-mute usando io.to
+    io.to(targetUserId).emit('force-mute', { isMuted });
+
+    console.log(
+      `[${new Date().toISOString()}] [${currentRoom}] Enviando evento force-mute para usuário ${targetUserId}: { isMuted: ${isMuted} }`
+    );
+  });
+
+  // Novo evento para atualizar status de fala
+  socket.on('speaking-status', ({ userId, isSpeaking }) => {
+    const currentRoom = Array.from(socket.rooms).find(
+      (room) => room !== socket.id
+    );
+    if (!currentRoom) return;
+
+    if (!speakingUsers.has(currentRoom)) {
+      speakingUsers.set(currentRoom, new Set());
+    }
+
+    if (isSpeaking) {
+      speakingUsers.get(currentRoom).add(userId);
+    } else {
+      speakingUsers.get(currentRoom).delete(userId);
+    }
+
+    // Notificar todos os usuários na sala sobre a mudança
+    io.to(currentRoom).emit('speaking-status-update', {
+      userId,
+      isSpeaking,
+    });
+  });
+
+  // Novo evento para diagnóstico de conexões
+  socket.on('check-connection', () => {
+    const currentUserId = socketToUserId.get(socket.id);
+    const currentRoom = Array.from(socket.rooms).find(
+      (room) => room !== socket.id
+    );
+
+    console.log(
+      `[${new Date().toISOString()}] Verificação de conexão solicitada por ${
+        currentUserId || 'socket desconhecido'
+      }`
+    );
+
+    // Verificar se o usuário está registrado
+    if (currentUserId) {
+      console.log(
+        `[${new Date().toISOString()}] Usuário ${currentUserId} está registrado`
+      );
+
+      // Verificar se o usuário está em uma sala
+      if (currentRoom) {
+        console.log(
+          `[${new Date().toISOString()}] Usuário ${currentUserId} está na sala ${currentRoom}`
+        );
+
+        // Verificar se o usuário está no mapeamento userSockets
+        if (userSockets.has(currentUserId)) {
+          console.log(
+            `[${new Date().toISOString()}] Usuário ${currentUserId} está no mapeamento userSockets`
+          );
+
+          // Verificar se o socket está conectado
+          if (socket.connected) {
+            console.log(
+              `[${new Date().toISOString()}] Socket do usuário ${currentUserId} está conectado`
+            );
+
+            // Enviar resposta com informações detalhadas
+            socket.emit('connection-status', {
+              userId: currentUserId,
+              room: currentRoom,
+              connected: true,
+              inUserSockets: true,
+              socketId: socket.id,
+              rooms: Array.from(socket.rooms),
+              usersInRoom: rooms.has(currentRoom)
+                ? Array.from(rooms.get(currentRoom))
+                : [],
+            });
+          } else {
+            console.log(
+              `[${new Date().toISOString()}] Socket do usuário ${currentUserId} não está conectado`
+            );
+            socket.emit('connection-status', {
+              userId: currentUserId,
+              room: currentRoom,
+              connected: false,
+              inUserSockets: true,
+              socketId: socket.id,
+              rooms: Array.from(socket.rooms),
+              usersInRoom: rooms.has(currentRoom)
+                ? Array.from(rooms.get(currentRoom))
+                : [],
+            });
+          }
+        } else {
+          console.log(
+            `[${new Date().toISOString()}] Usuário ${currentUserId} não está no mapeamento userSockets`
+          );
+          socket.emit('connection-status', {
+            userId: currentUserId,
+            room: currentRoom,
+            connected: socket.connected,
+            inUserSockets: false,
+            socketId: socket.id,
+            rooms: Array.from(socket.rooms),
+            usersInRoom: rooms.has(currentRoom)
+              ? Array.from(rooms.get(currentRoom))
+              : [],
+          });
+        }
+      } else {
+        console.log(
+          `[${new Date().toISOString()}] Usuário ${currentUserId} não está em nenhuma sala`
+        );
+        socket.emit('connection-status', {
+          userId: currentUserId,
+          room: null,
+          connected: socket.connected,
+          inUserSockets: userSockets.has(currentUserId),
+          socketId: socket.id,
+          rooms: Array.from(socket.rooms),
+        });
+      }
     } else {
       console.log(
-        `[${new Date().toISOString()}] Socket não encontrado para o usuário ${targetUserId}`
+        `[${new Date().toISOString()}] Socket ${
+          socket.id
+        } não está associado a nenhum usuário`
       );
+      socket.emit('connection-status', {
+        userId: null,
+        room: null,
+        connected: socket.connected,
+        inUserSockets: false,
+        socketId: socket.id,
+        rooms: Array.from(socket.rooms),
+      });
+    }
+  });
+
+  // Novo evento para verificar o estado do mute de um usuário
+  socket.on('check-mute-status', ({ targetUserId }) => {
+    const currentUserId = socketToUserId.get(socket.id);
+    const currentRoom = Array.from(socket.rooms).find(
+      (room) => room !== socket.id
+    );
+
+    console.log(
+      `[${new Date().toISOString()}] Verificação de mute solicitada por ${currentUserId} para ${targetUserId}`
+    );
+
+    if (!currentRoom || !currentUserId) {
+      console.log(
+        `[${new Date().toISOString()}] Verificação de mute falhou: usuário não está em uma sala`
+      );
+      socket.emit('mute-status', {
+        targetUserId,
+        isMuted: false,
+        mutedBy: [],
+        error: 'Usuário não está em uma sala',
+      });
+      return;
+    }
+
+    // Verificar se o usuário alvo está na sala
+    if (!rooms.has(currentRoom) || !rooms.get(currentRoom).has(targetUserId)) {
+      console.log(
+        `[${new Date().toISOString()}] Usuário ${targetUserId} não está na sala ${currentRoom}`
+      );
+      socket.emit('mute-status', {
+        targetUserId,
+        isMuted: false,
+        mutedBy: [],
+        error: 'Usuário alvo não está na sala',
+      });
+      return;
+    }
+
+    // Verificar o estado do mute
+    const isMuted =
+      mutedUsers.has(targetUserId) && mutedUsers.get(targetUserId).size > 0;
+    const mutedBy = isMuted ? Array.from(mutedUsers.get(targetUserId)) : [];
+
+    console.log(
+      `[${new Date().toISOString()}] Estado do mute para ${targetUserId}: ${
+        isMuted ? 'mutado' : 'não mutado'
+      }`
+    );
+    if (isMuted) {
+      console.log(
+        `[${new Date().toISOString()}] Mutado por: ${mutedBy.join(', ')}`
+      );
+    }
+
+    // Enviar resposta
+    socket.emit('mute-status', {
+      targetUserId,
+      isMuted,
+      mutedBy,
+      room: currentRoom,
+    });
+
+    // Se o usuário alvo for o próprio usuário, enviar o estado atual do mute
+    if (targetUserId === currentUserId) {
+      console.log(
+        `[${new Date().toISOString()}] Enviando estado atual do mute para o próprio usuário`
+      );
+      socket.emit('force-mute', { isMuted });
     }
   });
 });
@@ -309,6 +714,16 @@ process.on('unhandledRejection', (reason, promise) => {
   );
   // Não encerrar o processo, apenas logar o erro
 });
+
+// Atualizar a função de limpeza de sala para incluir speakingUsers
+function cleanupRoom(roomId) {
+  if (rooms.has(roomId)) {
+    rooms.delete(roomId);
+  }
+  if (speakingUsers.has(roomId)) {
+    speakingUsers.delete(roomId);
+  }
+}
 
 server.listen(PORT, () => {
   console.log(

@@ -74,6 +74,25 @@
             margin: 5px 0;
             background-color: #e9ecef;
             border-radius: 4px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .participant-controls {
+            display: flex;
+            gap: 5px;
+        }
+        .mute-button {
+            padding: 2px 8px;
+            border: none;
+            border-radius: 3px;
+            background-color: #dc3545;
+            color: white;
+            cursor: pointer;
+            font-size: 0.8em;
+        }
+        .mute-button.muted {
+            background-color: #28a745;
         }
         .error {
             color: #dc3545;
@@ -93,6 +112,41 @@
             padding: 10px;
             background-color: #f8f9fa;
             border-radius: 4px;
+        }
+        .speaking-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: #ccc;
+            margin-left: 10px;
+            display: inline-block;
+        }
+        .speaking-indicator.active {
+            background-color: #4CAF50;
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.2); }
+            100% { transform: scale(1); }
+        }
+        .notification {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background-color: #333;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 4px;
+            animation: slideIn 0.3s ease-out;
+            z-index: 1000;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        .mute-btn.muted {
+            background-color: #4CAF50;
         }
     </style>
 </head>
@@ -158,13 +212,17 @@
         let localStream;
         let peerConnections = {};
         let roomId = 'test-room';
-        let userId = Math.random().toString(36).substr(2, 9);
+        let userId = crypto.randomUUID();
         let isMuted = false;
         let participants = new Set();
         let audioContext;
         let gainNode;
         let reconnectAttempts = 0;
         const MAX_RECONNECT_ATTEMPTS = 3;
+        let audioAnalyser;
+        let speakingThreshold = -50; // dB
+        let isSpeaking = false;
+        let speakingTimeout;
 
         // Configuração melhorada do WebRTC com TURN
         const configuration = {
@@ -209,6 +267,9 @@
             try {
                 localStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
                 
+                // Iniciar detecção de fala
+                detectSpeaking(localStream);
+                
                 // Configurar processamento de áudio
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const source = audioContext.createMediaStreamSource(localStream);
@@ -229,7 +290,12 @@
                 currentUserIdSpan.textContent = userId;
                 connectionDetails.style.display = 'block';
                 
-                socket.emit('join-room', roomId, userId);
+                // Enviar evento join com os parâmetros corretos
+                socket.emit('join', { 
+                    gameId: roomId, 
+                    userId: userId,
+                    username: `Usuário ${userId.substr(0, 8)}` // Nome padrão baseado no ID
+                });
                 
                 // Resetar tentativas de reconexão
                 reconnectAttempts = 0;
@@ -250,7 +316,12 @@
             Object.values(peerConnections).forEach(pc => pc.close());
             peerConnections = {};
             
-            socket.emit('leave-room', roomId, userId);
+            // Enviar evento leave com os parâmetros corretos
+            socket.emit('leave', { 
+                gameId: roomId, 
+                userId: userId 
+            });
+            
             joinBtn.disabled = false;
             leaveBtn.disabled = true;
             muteBtn.disabled = true;
@@ -274,10 +345,20 @@
                 audioContext.close();
             }
             
-            Object.values(peerConnections).forEach(pc => pc.close());
+            // Limpar todas as conexões WebRTC
+            Object.values(peerConnections).forEach(pc => {
+                if (pc) {
+                    console.log(`[${new Date().toISOString()}] Fechando conexão WebRTC`);
+                    pc.close();
+                }
+            });
             peerConnections = {};
             
-            socket.emit('leave-room', roomId, userId);
+            // Enviar evento leave com os parâmetros corretos
+            socket.emit('leave', { 
+                gameId: roomId, 
+                userId: userId 
+            });
             
             // Resetar interface
             joinBtn.disabled = false;
@@ -323,33 +404,191 @@
 
         function updateParticipantsList() {
             participantsList.innerHTML = '';
-            participants.forEach(participant => {
+            participants.forEach(participantId => {
                 const div = document.createElement('div');
                 div.className = 'participant';
-                div.textContent = participant === userId ? `Você (${participant})` : participant;
+                div.id = `participant-${participantId}`;
+                
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = participantId === userId ? 'Você' : `Usuário ${participantId.substr(0, 8)}`;
+                
+                const controlsDiv = document.createElement('div');
+                controlsDiv.className = 'participant-controls';
+                
+                if (participantId !== userId) {
+                    const muteBtn = document.createElement('button');
+                    muteBtn.className = 'mute-btn';
+                    muteBtn.textContent = 'Mutar';
+                    muteBtn.onclick = () => toggleParticipantMute(participantId);
+                    controlsDiv.appendChild(muteBtn);
+                }
+                
+                const speakingIndicator = document.createElement('div');
+                speakingIndicator.className = 'speaking-indicator';
+                speakingIndicator.id = `speaking-${participantId}`;
+                
+                div.appendChild(nameSpan);
+                div.appendChild(controlsDiv);
+                div.appendChild(speakingIndicator);
                 participantsList.appendChild(div);
             });
             
-            // Atualizar contagem de participantes
             participantCountSpan.textContent = participants.size;
         }
+
+        function toggleParticipantMute(participantId) {
+            const button = document.querySelector(`#participant-${participantId} .mute-btn`);
+            const isMuted = button.textContent === 'Desmutar';
+            
+            console.log(`[${new Date().toISOString()}] Enviando toggle-participant-mute:`, {
+                targetUserId: participantId,
+                isMuted: !isMuted,
+                meuUserId: userId
+            });
+            
+            socket.emit('toggle-participant-mute', {
+                targetUserId: participantId,
+                isMuted: !isMuted
+            });
+            
+            // Atualizar o botão imediatamente para feedback visual
+            button.textContent = isMuted ? 'Mutar' : 'Desmutar';
+            button.className = `mute-btn ${isMuted ? '' : 'muted'}`;
+            
+            // Mostrar notificação
+            showNotification(`${isMuted ? 'Desmutando' : 'Mutando'} usuário ${participantId.substr(0, 8)}...`);
+        }
+
+        // Adicionar função para mostrar notificações
+        function showNotification(message) {
+            const notification = document.createElement('div');
+            notification.className = 'notification';
+            notification.textContent = message;
+            document.body.appendChild(notification);
+            
+            // Remover após 3 segundos
+            setTimeout(() => {
+                notification.remove();
+            }, 3000);
+        }
+
+        // Adicionar estilos para notificações
+        const notificationStyle = document.createElement('style');
+        notificationStyle.textContent = `
+            .notification {
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                background-color: #333;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 4px;
+                animation: slideIn 0.3s ease-out;
+                z-index: 1000;
+            }
+            @keyframes slideIn {
+                from { transform: translateX(100%); opacity: 0; }
+                to { transform: translateX(0); opacity: 1; }
+            }
+            .mute-btn.muted {
+                background-color: #4CAF50;
+            }
+        `;
+        document.head.appendChild(notificationStyle);
+
+        // Atualizar o listener de mute-changed
+        socket.on('participant-mute-changed', ({ userId, isMuted, mutedBy, sala, totalUsuariosNaSala }) => {
+            console.log(`[${new Date().toISOString()}] Recebido participant-mute-changed:`, {
+                userId,
+                isMuted,
+                mutedBy,
+                sala,
+                totalUsuariosNaSala,
+                meuUserId: userId
+            });
+            
+            const audioElement = document.getElementById(`audio-${userId}`);
+            if (audioElement) {
+                console.log(`[${new Date().toISOString()}] Atualizando estado do áudio:`, {
+                    userId,
+                    muted: isMuted,
+                    audioElementId: `audio-${userId}`
+                });
+                audioElement.muted = isMuted;
+            } else {
+                console.log(`[${new Date().toISOString()}] Áudio não encontrado para usuário:`, userId);
+            }
+            
+            const button = document.querySelector(`#participant-${userId} .mute-btn`);
+            if (button) {
+                console.log(`[${new Date().toISOString()}] Atualizando botão de mute:`, {
+                    userId,
+                    isMuted,
+                    buttonText: isMuted ? 'Desmutar' : 'Mutar'
+                });
+                button.textContent = isMuted ? 'Desmutar' : 'Mutar';
+                button.className = `mute-btn ${isMuted ? 'muted' : ''}`;
+            } else {
+                console.log(`[${new Date().toISOString()}] Botão não encontrado para usuário:`, userId);
+            }
+            
+            // Mostrar notificação de quem mutou/desmutou
+            const action = isMuted ? 'mutou' : 'desmutou';
+            const userDisplay = mutedBy === userId ? 'Você' : `Usuário ${mutedBy.substr(0, 8)}`;
+            const targetDisplay = userId === userId ? 'você' : `Usuário ${userId.substr(0, 8)}`;
+            const message = `${userDisplay} ${action} ${targetDisplay} (Sala: ${sala}, Total: ${totalUsuariosNaSala} usuários)`;
+            console.log(`[${new Date().toISOString()}] Mostrando notificação:`, message);
+            showNotification(message);
+        });
+
+        // Atualizar eventos de saída para limpar estado de mute
+        socket.on('user-left', ({ userId }) => {
+            console.log(`[${new Date().toISOString()}] Usuário ${userId} saiu da sala`);
+            
+            // Limpar conexão WebRTC
+            if (peerConnections[userId]) {
+                console.log(`[${new Date().toISOString()}] Fechando conexão WebRTC com ${userId}`);
+                peerConnections[userId].close();
+                delete peerConnections[userId];
+            }
+            
+            // Limpar estado de mute
+            const audioElement = document.getElementById(`audio-${userId}`);
+            if (audioElement) {
+                audioElement.muted = false;
+            }
+            
+            participants.delete(userId);
+            updateParticipantsList();
+            showNotification(`Usuário ${userId.substr(0, 8)} saiu da sala`);
+        });
+
+        socket.on('user-disconnected', ({ userId }) => {
+            console.log(`[${new Date().toISOString()}] Usuário ${userId} desconectou`);
+            
+            // Limpar conexão WebRTC
+            if (peerConnections[userId]) {
+                console.log(`[${new Date().toISOString()}] Fechando conexão WebRTC com ${userId}`);
+                peerConnections[userId].close();
+                delete peerConnections[userId];
+            }
+            
+            // Limpar estado de mute
+            const audioElement = document.getElementById(`audio-${userId}`);
+            if (audioElement) {
+                audioElement.muted = false;
+            }
+            
+            participants.delete(userId);
+            updateParticipantsList();
+            showNotification(`Usuário ${userId.substr(0, 8)} desconectou`);
+        });
 
         socket.on('user-connected', async (newUserId) => {
             console.log('Novo usuário conectado:', newUserId);
             participants.add(newUserId);
             updateParticipantsList();
             createPeerConnection(newUserId);
-        });
-
-        socket.on('user-disconnected', (disconnectedUserId) => {
-            console.log('Usuário desconectado:', disconnectedUserId);
-            participants.delete(disconnectedUserId);
-            updateParticipantsList();
-            
-            if (peerConnections[disconnectedUserId]) {
-                peerConnections[disconnectedUserId].close();
-                delete peerConnections[disconnectedUserId];
-            }
         });
 
         socket.on('room-full', () => {
@@ -363,25 +602,25 @@
             updateParticipantsList();
         });
 
-        socket.on('offer', async (offer, fromUserId) => {
-            console.log('Recebendo oferta de:', fromUserId);
+        socket.on('offer', async ({ offer, fromUserId }) => {
+            console.log(`[${new Date().toISOString()}] Recebendo oferta de:`, fromUserId);
             const pc = createPeerConnection(fromUserId);
             await pc.setRemoteDescription(new RTCSessionDescription(offer));
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
-            socket.emit('answer', answer, roomId, userId);
+            socket.emit('answer', { answer, targetUserId: fromUserId });
         });
 
-        socket.on('answer', async (answer, fromUserId) => {
-            console.log('Recebendo resposta de:', fromUserId);
+        socket.on('answer', async ({ answer, fromUserId }) => {
+            console.log(`[${new Date().toISOString()}] Recebendo resposta de:`, fromUserId);
             const pc = peerConnections[fromUserId];
             if (pc) {
                 await pc.setRemoteDescription(new RTCSessionDescription(answer));
             }
         });
 
-        socket.on('ice-candidate', async (candidate, fromUserId) => {
-            console.log('Recebendo candidato ICE de:', fromUserId);
+        socket.on('ice-candidate', async ({ candidate, fromUserId }) => {
+            console.log(`[${new Date().toISOString()}] Recebendo candidato ICE de:`, fromUserId);
             const pc = peerConnections[fromUserId];
             if (pc) {
                 await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -398,27 +637,28 @@
 
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
-                    socket.emit('ice-candidate', event.candidate, roomId, userId);
+                    socket.emit('ice-candidate', { 
+                        candidate: event.candidate, 
+                        targetUserId: userId 
+                    });
                 }
             };
 
             pc.oniceconnectionstatechange = () => {
-                console.log(`Estado da conexão ICE com ${userId}:`, pc.iceConnectionState);
+                console.log(`[${new Date().toISOString()}] Estado da conexão ICE com ${userId}:`, pc.iceConnectionState);
                 if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
                     showError(`Conexão com ${userId} perdida. Tentando reconectar...`);
                     
-                    // Tentar reconectar
                     if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                         reconnectAttempts++;
                         setTimeout(() => {
-                            console.log(`Tentativa de reconexão ${reconnectAttempts} com ${userId}`);
+                            console.log(`[${new Date().toISOString()}] Tentativa de reconexão ${reconnectAttempts} com ${userId}`);
                             createPeerConnection(userId);
-                        }, 2000 * reconnectAttempts); // Aumentar o tempo entre tentativas
+                        }, 2000 * reconnectAttempts);
                     } else {
                         showError(`Não foi possível reconectar com ${userId} após ${MAX_RECONNECT_ATTEMPTS} tentativas.`);
                     }
                 } else if (pc.iceConnectionState === 'connected') {
-                    // Conexão estabelecida com sucesso
                     reconnectAttempts = 0;
                 }
             };
@@ -427,12 +667,9 @@
                 const remoteAudio = new Audio();
                 remoteAudio.srcObject = event.streams[0];
                 remoteAudio.autoplay = true;
+                remoteAudio.id = `audio-${userId}`;
                 remoteAudio.volume = volumeSlider.value / 100;
-                
-                // Atualizar volume quando o slider mudar
-                volumeSlider.addEventListener('input', () => {
-                    remoteAudio.volume = volumeSlider.value / 100;
-                });
+                document.body.appendChild(remoteAudio);
             };
 
             if (localStream) {
@@ -445,15 +682,144 @@
                 try {
                     const offer = await pc.createOffer();
                     await pc.setLocalDescription(offer);
-                    socket.emit('offer', offer, roomId, userId);
+                    socket.emit('offer', { 
+                        offer: pc.localDescription, 
+                        targetUserId: userId 
+                    });
                 } catch (err) {
-                    console.error('Erro na negociação:', err);
+                    console.error(`[${new Date().toISOString()}] Erro na negociação:`, err);
                     showError('Erro na negociação da conexão');
                 }
             };
 
             return pc;
         }
+
+        // Função para detectar fala ativa
+        function detectSpeaking(audioStream) {
+            if (!audioContext) return;
+            
+            const source = audioContext.createMediaStreamSource(audioStream);
+            audioAnalyser = audioContext.createAnalyser();
+            audioAnalyser.fftSize = 2048;
+            source.connect(audioAnalyser);
+            
+            const dataArray = new Uint8Array(audioAnalyser.frequencyBinCount);
+            
+            function checkAudioLevel() {
+                if (!audioAnalyser) return;
+                
+                audioAnalyser.getByteFrequencyData(dataArray);
+                const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+                const db = 20 * Math.log10(average / 255);
+                
+                if (db > speakingThreshold && !isSpeaking) {
+                    isSpeaking = true;
+                    socket.emit('speaking-status', { userId, isSpeaking: true });
+                    clearTimeout(speakingTimeout);
+                } else if (db <= speakingThreshold && isSpeaking) {
+                    speakingTimeout = setTimeout(() => {
+                        isSpeaking = false;
+                        socket.emit('speaking-status', { userId, isSpeaking: false });
+                    }, 500); // Aguarda 500ms para confirmar que parou de falar
+                }
+                
+                requestAnimationFrame(checkAudioLevel);
+            }
+            
+            checkAudioLevel();
+        }
+
+        // Adicionar listener para atualização de status de fala
+        socket.on('speaking-status-update', ({ userId: speakingUserId, isSpeaking }) => {
+            const indicator = document.getElementById(`speaking-${speakingUserId}`);
+            if (indicator) {
+                indicator.className = `speaking-indicator ${isSpeaking ? 'active' : ''}`;
+            }
+        });
+
+        // Adicionar listener para o evento force-mute
+        socket.on('force-mute', ({ isMuted }) => {
+            console.log(`[${new Date().toISOString()}] Recebido force-mute:`, { isMuted });
+            console.log(`[${new Date().toISOString()}] Meu userId:`, userId);
+            
+            // Atualizar o estado do mute local
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                if (audioTrack) {
+                    // Forçar o mute/desmute do áudio
+                    audioTrack.enabled = !isMuted;
+                    console.log(`[${new Date().toISOString()}] Áudio local mutado:`, !audioTrack.enabled);
+                    
+                    // Verificar se o mute foi aplicado
+                    setTimeout(() => {
+                        console.log(`[${new Date().toISOString()}] Verificando se o mute foi aplicado:`, !audioTrack.enabled);
+                        if (audioTrack.enabled !== !isMuted) {
+                            console.log(`[${new Date().toISOString()}] Tentando aplicar o mute novamente`);
+                            audioTrack.enabled = !isMuted;
+                        }
+                    }, 100);
+                }
+            }
+            
+            // Atualizar o botão de mute local
+            if (muteBtn) {
+                muteBtn.textContent = isMuted ? 'Desmutar' : 'Mutar';
+            }
+            
+            // Mostrar notificação
+            showNotification(`Você foi ${isMuted ? 'mutado' : 'desmutado'} por outro usuário`);
+        });
+
+        // Função para verificar o estado do mute
+        function checkMuteStatus(targetUserId) {
+            console.log(`[${new Date().toISOString()}] Verificando estado do mute para usuário ${targetUserId}`);
+            socket.emit('check-mute-status', { targetUserId });
+        }
+
+        // Listener para receber o estado do mute
+        socket.on('mute-status', (data) => {
+            console.log(`[${new Date().toISOString()}] Estado do mute recebido:`, data);
+            
+            if (data.error) {
+                console.error(`[${new Date().toISOString()}] Erro ao verificar mute:`, data.error);
+                return;
+            }
+
+            const { targetUserId, isMuted, mutedBy, room } = data;
+            
+            // Atualizar o estado do mute na UI
+            const muteButton = document.querySelector(`[data-user-id="${targetUserId}"] .mute-button`);
+            if (muteButton) {
+                muteButton.textContent = isMuted ? 'Desmutar' : 'Mutado';
+                muteButton.classList.toggle('muted', isMuted);
+            }
+
+            // Se for o próprio usuário, atualizar o estado do áudio
+            if (targetUserId === userId) {
+                console.log(`[${new Date().toISOString()}] Atualizando estado do áudio local`);
+                if (localStream) {
+                    localStream.getAudioTracks().forEach(track => {
+                        track.enabled = !isMuted;
+                    });
+                    console.log(`[${new Date().toISOString()}] Áudio local ${isMuted ? 'desativado' : 'ativado'}`);
+                }
+            }
+
+            // Mostrar notificação
+            if (isMuted) {
+                showNotification(`Usuário ${targetUserId} está mutado por: ${mutedBy.join(', ')}`);
+            } else {
+                showNotification(`Usuário ${targetUserId} não está mutado`);
+            }
+        });
+
+        // Verificar estado do mute periodicamente
+        setInterval(() => {
+            if (userId) {
+                checkMuteStatus(userId);
+            }
+        }, 5000); // Verificar a cada 5 segundos
     </script>
 </body>
 </html> 
